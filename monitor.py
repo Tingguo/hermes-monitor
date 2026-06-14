@@ -19,6 +19,7 @@ import sys
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
+from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
 # ----------------------------------------------------------------------
@@ -65,24 +66,34 @@ window.chrome = {runtime: {}};
 # 抓取：在已打开的页面里访问某个搜索页，取出命中 slug 的商品 {slug: url}
 # ----------------------------------------------------------------------
 def fetch_products(page, url: str, slug_filter: str) -> dict[str, str]:
-    page.goto(url, wait_until="networkidle", timeout=60000)
-    page.wait_for_timeout(4000)  # 等商品网格渲染
+    # 正常搜索页一定有商品链接（即使缺货也有约 10 个推荐兜底）。
+    # 所以"等到商品元素出现"，慢渲染就多等；拿到 0 个就重试一次。
+    hrefs: list[str] = []
+    for attempt in range(1, 3):
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_selector("a[href*='/product/']", timeout=20000)
+        except PWTimeout:
+            pass
+        page.wait_for_timeout(2500)  # 让网格补齐
 
-    body_sample = page.content().lower()
-    blocked = (
-        "temporarily restricted" in body_sample
-        or "unusual activity" in body_sample
-        or "access denied" in body_sample
-    )
-    hrefs = page.eval_on_selector_all(
-        "a[href*='/product/']", "els => els.map(e => e.href)"
-    )
+        body_sample = page.content().lower()
+        if any(s in body_sample for s in
+               ("temporarily restricted", "unusual activity", "access denied")):
+            raise RuntimeError("被反爬拦截（Access temporarily restricted）")
 
-    # 诊断：页面渲染正常时商品链接总数应 > 0（搜索页约 10 个推荐）；
-    # 若为 0 或命中拦截关键词，很可能被静默给了空页面，按拦截处理（报错而非静默漏报）。
+        hrefs = page.eval_on_selector_all(
+            "a[href*='/product/']", "els => els.map(e => e.href)"
+        )
+        if hrefs:
+            break
+        print(f"[WARN] {url} 第 {attempt} 次拿到 0 个商品，等待后重试…")
+        page.wait_for_timeout(4000)
+
+    # 渲染正常时总数 > 0；重试后仍为 0，多半是被静默给了空页面 → 报错而非漏报。
     print(f"[INFO] {url} → 商品链接总数 {len(hrefs)}")
-    if blocked or len(hrefs) == 0:
-        raise RuntimeError("被反爬拦截或拿到空页面 —— 真浏览器伪装可能失效")
+    if len(hrefs) == 0:
+        raise RuntimeError("重试后仍拿到空页面 —— 真浏览器伪装可能失效")
 
     products: dict[str, str] = {}
     for href in hrefs:
