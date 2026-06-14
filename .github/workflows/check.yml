@@ -51,11 +51,16 @@ jobs:
 
       - name: 运行监控（有头模式，用 xvfb 提供虚拟显示器）
         env:
-          LISTING_URL: ${{ secrets.LISTING_URL }}
-          SLUG_FILTER: ${{ secrets.SLUG_FILTER }}
-          MATCH_KEYWORD: ${{ secrets.MATCH_KEYWORD }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_TEST: ${{ (inputs.send_test == true || inputs.send_test == 'true') && '1' || '' }}
         run: xvfb-run -a python monitor.py
+
+      - name: 上传调试截图（仅在抓取失败时有内容）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug-*.png
+          if-no-files-found: ignore

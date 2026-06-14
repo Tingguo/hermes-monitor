@@ -65,7 +65,7 @@ window.chrome = {runtime: {}};
 # ----------------------------------------------------------------------
 # 抓取：在已打开的页面里访问某个搜索页，取出命中 slug 的商品 {slug: url}
 # ----------------------------------------------------------------------
-def fetch_products(page, url: str, slug_filter: str) -> dict[str, str]:
+def fetch_products(page, url: str, slug_filter: str, name: str = "") -> dict[str, str]:
     # 正常搜索页一定有商品链接（即使缺货也有约 10 个推荐兜底）。
     # 所以"等到商品元素出现"，慢渲染就多等；拿到 0 个就重试一次。
     hrefs: list[str] = []
@@ -93,6 +93,14 @@ def fetch_products(page, url: str, slug_filter: str) -> dict[str, str]:
     # 渲染正常时总数 > 0；重试后仍为 0，多半是被静默给了空页面 → 报错而非漏报。
     print(f"[INFO] {url} → 商品链接总数 {len(hrefs)}")
     if len(hrefs) == 0:
+        # 诊断：把云端实际看到的页面信息和截图留下来
+        try:
+            print(f"[DEBUG] title={page.title()!r} content_len={len(page.content())}")
+            safe = re.sub(r"[^a-z0-9]+", "-", (name or "page").lower())
+            page.screenshot(path=f"debug-{safe}.png", full_page=True)
+            print(f"[DEBUG] 已保存截图 debug-{safe}.png")
+        except Exception as e:
+            print(f"[DEBUG] 截图失败: {e}")
         raise RuntimeError("重试后仍拿到空页面 —— 真浏览器伪装可能失效")
 
     products: dict[str, str] = {}
@@ -178,7 +186,7 @@ def main() -> int:
         for w in WATCHES:
             name = w["name"]
             try:
-                current = fetch_products(page, w["url"], w["slug"])
+                current = fetch_products(page, w["url"], w["slug"], name)
             except Exception as e:
                 # 某一款抓取失败（如临时被拦）不影响其它款；保留它的旧基线
                 print(f"[ERROR] [{name}] 抓取失败: {e}", file=sys.stderr)
