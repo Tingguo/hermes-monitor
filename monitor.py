@@ -1,14 +1,14 @@
 """
-Hermès Australia 库存监控（Lindy 系列）
+Hermès Australia 库存监控（多款）
 -------------------------------------------------
-做法：用真浏览器内核(Playwright)打开爱马仕澳洲官网的 Lindy 筛选列表页，
-抓出"当前在售的所有 Lindy 款"，和上次记录对比。一旦出现【新的款】
-（尤其名字带 mini），就发邮件通知你，并附上商品链接。
+做法：用真浏览器内核(Playwright)逐个打开爱马仕澳洲官网的搜索页，
+抓出"当前在售的目标系列"，和上次记录对比。一旦出现【新的款】，
+就发邮件通知你，并附上商品链接。每款独立记基线、独立通知。
 
 为什么用真浏览器：爱马仕用了 Akamai 反爬，普通 HTTP 请求会被 403 拦截，
 只有真浏览器内核的网络指纹能通过。
 
-所有敏感信息（邮箱密码、收件人）都从环境变量读取，由 GitHub Secrets 注入。
+要加/改监控目标，编辑下面的 WATCHES 即可。
 """
 
 import json
@@ -22,16 +22,27 @@ from email.utils import formataddr
 from playwright.sync_api import sync_playwright
 
 # ----------------------------------------------------------------------
-# 配置（通过环境变量传入，见 README）
+# 监控目标列表 —— 想加新款就往这里加一条
+#   name    : 邮件里显示的名字
+#   url     : 爱马仕搜索页（缺货时返回无关推荐，slug 不含目标词 → 零误报）
+#   slug    : 商品链接 slug 含此词才算命中（用来排除推荐兜底的无关货）
+#   keyword : 邮件标题高亮用的词（不参与筛选）
 # ----------------------------------------------------------------------
-# 默认用搜索页找 Lindy（缺货时返回的是无关推荐，slug 不含 lindy → 零误报）
-# 注意用 `or`：GitHub 未设置的 secret 会传空字符串，空串也要回退到默认值
-LISTING_URL = os.environ.get("LISTING_URL") or \
-    "https://www.hermes.com/au/en/search/?s=lindy"
-# 只保留 slug 含此词的商品才算"真·目标命中"。默认 lindy。
-SLUG_FILTER = (os.environ.get("SLUG_FILTER") or "lindy").lower()
-# 优先关注的关键词（名字含此词的新款会在邮件里高亮）。
-MATCH_KEYWORD = (os.environ.get("MATCH_KEYWORD") or "mini").lower()
+WATCHES = [
+    {
+        "name": "Lindy",
+        "url": "https://www.hermes.com/au/en/search/?s=lindy",
+        "slug": "lindy",
+        "keyword": "mini",
+    },
+    {
+        "name": "Neo Garden 23",
+        "url": "https://www.hermes.com/au/en/search/?s=neo%20garden",
+        "slug": "neo-garden",
+        "keyword": "23",
+    },
+]
+
 # 是否无头运行。爱马仕的反爬对无头很敏感，必须有头(云端用 xvfb 提供虚拟显示器)。
 HEADLESS = os.environ.get("HEADLESS", "0") == "1"
 
@@ -51,76 +62,56 @@ window.chrome = {runtime: {}};
 
 
 # ----------------------------------------------------------------------
-# 抓取：用真浏览器打开列表页，取出所有 Lindy 商品 {slug: url}
+# 抓取：在已打开的页面里访问某个搜索页，取出命中 slug 的商品 {slug: url}
 # ----------------------------------------------------------------------
-def fetch_lindy_products() -> dict[str, str]:
-    products: dict[str, str] = {}
-    with sync_playwright() as p:
-        # channel="chrome" 用系统真实 Chrome（比内置 Chromium 更难被识破）
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            channel="chrome",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            locale="en-AU",
-            viewport={"width": 1366, "height": 900},
-        )
-        context.add_init_script(STEALTH_JS)
-        page = context.new_page()
-        page.goto(LISTING_URL, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(4000)  # 等商品网格渲染
+def fetch_products(page, url: str, slug_filter: str) -> dict[str, str]:
+    page.goto(url, wait_until="networkidle", timeout=60000)
+    page.wait_for_timeout(4000)  # 等商品网格渲染
 
-        body_sample = page.content().lower()
-        blocked = (
-            "temporarily restricted" in body_sample
-            or "unusual activity" in body_sample
-            or "access denied" in body_sample
-        )
-
-        # 取所有指向 /product/ 的链接
-        hrefs = page.eval_on_selector_all(
-            "a[href*='/product/']",
-            "els => els.map(e => e.href)",
-        )
-        browser.close()
+    body_sample = page.content().lower()
+    blocked = (
+        "temporarily restricted" in body_sample
+        or "unusual activity" in body_sample
+        or "access denied" in body_sample
+    )
+    hrefs = page.eval_on_selector_all(
+        "a[href*='/product/']", "els => els.map(e => e.href)"
+    )
 
     # 诊断：页面渲染正常时商品链接总数应 > 0（搜索页约 10 个推荐）；
-    # 若为 0 且未命中拦截关键词，很可能是被静默给了空页面，按拦截处理。
-    print(f"[INFO] 页面商品链接总数 {len(hrefs)}")
+    # 若为 0 或命中拦截关键词，很可能被静默给了空页面，按拦截处理（报错而非静默漏报）。
+    print(f"[INFO] {url} → 商品链接总数 {len(hrefs)}")
     if blocked or len(hrefs) == 0:
-        raise RuntimeError(
-            "被反爬拦截或拿到空页面（商品总数 0）—— 真浏览器伪装可能失效"
-        )
+        raise RuntimeError("被反爬拦截或拿到空页面 —— 真浏览器伪装可能失效")
 
-    # 从链接 slug 里解析款式名，过滤出 lindy
+    products: dict[str, str] = {}
     for href in hrefs:
         m = re.search(r"/product/([^/?#]+)", href)
         if not m:
             continue
         slug = m.group(1)
-        if SLUG_FILTER not in slug.lower():
+        if slug_filter.lower() not in slug.lower():
             continue
         products[slug] = href.split("?")[0]
     return products
 
 
 # ----------------------------------------------------------------------
-# 状态持久化：记录上次见到的 Lindy 款式集合
+# 状态持久化：每款记一组见过的 slug   {watches: {name: [slug,...]}}
 # ----------------------------------------------------------------------
-def load_seen() -> set[str]:
+def load_state() -> dict[str, list[str]]:
     if not os.path.exists(STATE_FILE):
-        return set()
+        return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f).get("seen", []))
+            return json.load(f).get("watches", {})
     except (json.JSONDecodeError, OSError):
-        return set()
+        return {}
 
 
-def save_seen(slugs: set[str]) -> None:
+def save_state(watches: dict[str, list[str]]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"seen": sorted(slugs)}, f, ensure_ascii=False, indent=2)
+        json.dump({"watches": watches}, f, ensure_ascii=False, indent=2)
 
 
 # ----------------------------------------------------------------------
@@ -157,40 +148,59 @@ def main() -> int:
         )
         return 0
 
-    try:
-        current = fetch_lindy_products()
-    except Exception as e:
-        print(f"[ERROR] 抓取失败: {e}", file=sys.stderr)
-        return 1
+    state = load_state()
+    had_error = False
 
-    print(f"[INFO] 当前在售 Lindy 款式 {len(current)} 个: {sorted(current)}")
-
-    seen = load_seen()
-    first_run = not os.path.exists(STATE_FILE)
-    new_slugs = set(current) - seen
-
-    if new_slugs and not first_run:
-        # 关键词优先排序（带 mini 的排前面）
-        ordered = sorted(
-            new_slugs, key=lambda s: (MATCH_KEYWORD not in s.lower(), s)
+    with sync_playwright() as p:
+        # channel="chrome" 用系统真实 Chrome（比内置 Chromium 更难被识破）
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            channel="chrome",
+            args=["--disable-blink-features=AutomationControlled"],
         )
-        lines = [f"· {nice_name(s)}\n{current[s]}" for s in ordered]
-        body = "爱马仕澳洲官网 Lindy 系列出现新款（可能上线了）：\n\n" + "\n\n".join(lines)
-        hot = [s for s in ordered if MATCH_KEYWORD in s.lower()]
-        title = (
-            f"🎉 Hermès 上新！{nice_name(hot[0])}"
-            if hot
-            else f"🎉 Hermès Lindy 上新 {len(new_slugs)} 款"
+        context = browser.new_context(
+            locale="en-AU", viewport={"width": 1366, "height": 900}
         )
-        send_email(title, body)
-    elif first_run:
-        print("[INFO] 首次运行，记录基线，不发通知")
-    else:
-        print("[INFO] 没有新款")
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
 
-    # 更新基线（记录所有当前款式，下次只对比新增）
-    save_seen(set(current))
-    return 0
+        for w in WATCHES:
+            name = w["name"]
+            try:
+                current = fetch_products(page, w["url"], w["slug"])
+            except Exception as e:
+                # 某一款抓取失败（如临时被拦）不影响其它款；保留它的旧基线
+                print(f"[ERROR] [{name}] 抓取失败: {e}", file=sys.stderr)
+                had_error = True
+                continue
+
+            print(f"[INFO] [{name}] 当前在售 {len(current)} 个: {sorted(current)}")
+
+            first_run = name not in state
+            seen = set(state.get(name, []))
+            new_slugs = set(current) - seen
+
+            if new_slugs and not first_run:
+                kw = w["keyword"].lower()
+                ordered = sorted(new_slugs, key=lambda s: (kw not in s.lower(), s))
+                lines = [f"· {nice_name(s)}\n{current[s]}" for s in ordered]
+                body = (f"爱马仕澳洲官网【{name}】出现新款（可能上线了）：\n\n"
+                        + "\n\n".join(lines))
+                title = f"🎉 Hermès 上新！{nice_name(ordered[0])}"
+                send_email(title, body)
+            elif first_run:
+                print(f"[INFO] [{name}] 首次运行，记录基线，不发通知")
+            else:
+                print(f"[INFO] [{name}] 没有新款")
+
+            # 更新该款基线（只在成功抓取时更新）
+            state[name] = sorted(current)
+
+        browser.close()
+
+    save_state(state)
+    # 有任何一款抓取失败就让这次运行标红，方便发现问题
+    return 1 if had_error else 0
 
 
 if __name__ == "__main__":
