@@ -85,8 +85,13 @@ def fetch_lindy_products() -> dict[str, str]:
         )
         browser.close()
 
-    if blocked:
-        raise RuntimeError("被 Akamai 反爬拦截（Access temporarily restricted）")
+    # 诊断：页面渲染正常时商品链接总数应 > 0（搜索页约 10 个推荐）；
+    # 若为 0 且未命中拦截关键词，很可能是被静默给了空页面，按拦截处理。
+    print(f"[INFO] 页面商品链接总数 {len(hrefs)}")
+    if blocked or len(hrefs) == 0:
+        raise RuntimeError(
+            "被反爬拦截或拿到空页面（商品总数 0）—— 真浏览器伪装可能失效"
+        )
 
     # 从链接 slug 里解析款式名，过滤出 lindy
     for href in hrefs:
