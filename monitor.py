@@ -69,7 +69,7 @@ def fetch_products(page, url: str, slug_filter: str, name: str = "") -> dict[str
     # 正常搜索页一定有商品链接（即使缺货也有约 10 个推荐兜底）。
     # 所以"等到商品元素出现"，慢渲染就多等；拿到 0 个就重试一次。
     hrefs: list[str] = []
-    for attempt in range(1, 3):
+    for attempt in range(1, 4):
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         try:
             page.wait_for_selector("a[href*='/product/']", timeout=20000)
@@ -177,14 +177,15 @@ def main() -> int:
             channel="chrome",
             args=["--disable-blink-features=AutomationControlled"],
         )
-        context = browser.new_context(
-            locale="en-AU", viewport={"width": 1366, "height": 900}
-        )
-        context.add_init_script(STEALTH_JS)
-        page = context.new_page()
 
         for w in WATCHES:
             name = w["name"]
+            # 每款用全新上下文，让每次都是"首次访问"（首访最不易被拦）
+            context = browser.new_context(
+                locale="en-AU", viewport={"width": 1366, "height": 900}
+            )
+            context.add_init_script(STEALTH_JS)
+            page = context.new_page()
             try:
                 current = fetch_products(page, w["url"], w["slug"], name)
             except Exception as e:
@@ -192,6 +193,8 @@ def main() -> int:
                 print(f"[ERROR] [{name}] 抓取失败: {e}", file=sys.stderr)
                 had_error = True
                 continue
+            finally:
+                context.close()
 
             print(f"[INFO] [{name}] 当前在售 {len(current)} 个: {sorted(current)}")
 
