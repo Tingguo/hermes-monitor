@@ -57,5 +57,5 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-          SEND_TEST: ${{ inputs.send_test == true && '1' || '' }}
+          SEND_TEST: ${{ (inputs.send_test == true || inputs.send_test == 'true') && '1' || '' }}
         run: xvfb-run -a python monitor.py
