@@ -25,14 +25,13 @@ from playwright.sync_api import sync_playwright
 # 配置（通过环境变量传入，见 README）
 # ----------------------------------------------------------------------
 # 默认用搜索页找 Lindy（缺货时返回的是无关推荐，slug 不含 lindy → 零误报）
-LISTING_URL = os.environ.get(
-    "LISTING_URL",
-    "https://www.hermes.com/au/en/search/?s=lindy",
-)
+# 注意用 `or`：GitHub 未设置的 secret 会传空字符串，空串也要回退到默认值
+LISTING_URL = os.environ.get("LISTING_URL") or \
+    "https://www.hermes.com/au/en/search/?s=lindy"
 # 只保留 slug 含此词的商品才算"真·目标命中"。默认 lindy。
-SLUG_FILTER = os.environ.get("SLUG_FILTER", "lindy").lower()
+SLUG_FILTER = (os.environ.get("SLUG_FILTER") or "lindy").lower()
 # 优先关注的关键词（名字含此词的新款会在邮件里高亮）。
-MATCH_KEYWORD = os.environ.get("MATCH_KEYWORD", "mini").lower()
+MATCH_KEYWORD = (os.environ.get("MATCH_KEYWORD") or "mini").lower()
 # 是否无头运行。爱马仕的反爬对无头很敏感，必须有头(云端用 xvfb 提供虚拟显示器)。
 HEADLESS = os.environ.get("HEADLESS", "0") == "1"
 
