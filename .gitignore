@@ -1,0 +1,6 @@
+.venv/
+state.json
+debug*.py
+debug*.png
+*.png
+__pycache__/

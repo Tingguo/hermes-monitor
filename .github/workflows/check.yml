@@ -1,0 +1,61 @@
+name: Hermès Lindy 监控
+
+on:
+  schedule:
+    # 每 10 分钟运行一次（GitHub 高峰期可能略延迟）
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "只发一封测试邮件验证通道（不检查库存）"
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      # 缓存浏览器，避免每次重新下载
+      - name: 缓存 Chrome
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chrome-v1
+
+      # 安装真实 Google Chrome（channel=chrome 需要）+ 系统依赖 + 虚拟显示器
+      - name: 安装 Chrome 和 xvfb
+        run: |
+          python -m playwright install-deps chromium
+          python -m playwright install chrome
+          sudo apt-get install -y xvfb
+
+      # 用缓存在多次运行之间保存 state.json（记住上次见到哪些款）
+      - name: 恢复上次状态
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: hermes-state-${{ github.run_id }}
+          restore-keys: |
+            hermes-state-
+
+      - name: 运行监控（有头模式，用 xvfb 提供虚拟显示器）
+        env:
+          LISTING_URL: ${{ secrets.LISTING_URL }}
+          SLUG_FILTER: ${{ secrets.SLUG_FILTER }}
+          MATCH_KEYWORD: ${{ secrets.MATCH_KEYWORD }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SEND_TEST: ${{ inputs.send_test == true && '1' || '' }}
+        run: xvfb-run -a python monitor.py
