@@ -115,22 +115,52 @@ def fetch_products(page, url: str, slug_filter: str, name: str = "") -> dict[str
     return products
 
 
+# 连续失败多少次才告警（每 10 分钟一跑；4 次≈40 分钟都拿不到 → 多半真出问题了）
+ALERT_THRESHOLD = 4
+
+
 # ----------------------------------------------------------------------
-# 状态持久化：每款记一组见过的 slug   {watches: {name: [slug,...]}}
+# 状态持久化
+#   watches: {name: [slug,...]}   每款见过的 slug（基线）
+#   fails:   {name: 连续失败次数}  用来区分"偶发被拦"和"真的坏了"
 # ----------------------------------------------------------------------
-def load_state() -> dict[str, list[str]]:
+def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return {}
+        return {"watches": {}, "fails": {}}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f).get("watches", {})
+            data = json.load(f)
+        return {"watches": data.get("watches", {}), "fails": data.get("fails", {})}
     except (json.JSONDecodeError, OSError):
-        return {}
+        return {"watches": {}, "fails": {}}
 
 
-def save_state(watches: dict[str, list[str]]) -> None:
+def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"watches": watches}, f, ensure_ascii=False, indent=2)
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ----------------------------------------------------------------------
+# 抓取一款：用全新 context（首访最不易被拦）；失败时再换全新 context 补抓一次
+# ----------------------------------------------------------------------
+def fetch_watch(browser, w: dict) -> dict[str, str]:
+    last_err: Exception | None = None
+    for tryno in (1, 2):
+        context = browser.new_context(
+            locale="en-AU", viewport={"width": 1366, "height": 900}
+        )
+        context.add_init_script(STEALTH_JS)
+        page = context.new_page()
+        try:
+            return fetch_products(page, w["url"], w["slug"], w["name"])
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if tryno == 1:
+                print(f"[WARN] [{w['name']}] 第 1 轮失败，换全新浏览器再试一次…")
+        finally:
+            context.close()
+    assert last_err is not None
+    raise last_err
 
 
 # ----------------------------------------------------------------------
@@ -168,7 +198,9 @@ def main() -> int:
         return 0
 
     state = load_state()
-    had_error = False
+    watches = state["watches"]
+    fails = state["fails"]
+    newly_broken: list[str] = []  # 这次刚好达到告警阈值的款
 
     with sync_playwright() as p:
         # channel="chrome" 用系统真实 Chrome（比内置 Chromium 更难被识破）
@@ -180,26 +212,24 @@ def main() -> int:
 
         for w in WATCHES:
             name = w["name"]
-            # 每款用全新上下文，让每次都是"首次访问"（首访最不易被拦）
-            context = browser.new_context(
-                locale="en-AU", viewport={"width": 1366, "height": 900}
-            )
-            context.add_init_script(STEALTH_JS)
-            page = context.new_page()
             try:
-                current = fetch_products(page, w["url"], w["slug"], name)
-            except Exception as e:
-                # 某一款抓取失败（如临时被拦）不影响其它款；保留它的旧基线
-                print(f"[ERROR] [{name}] 抓取失败: {e}", file=sys.stderr)
-                had_error = True
+                current = fetch_watch(browser, w)
+            except Exception as e:  # noqa: BLE001
+                # 抓取失败（多半是 Akamai 临时软拦）：保留旧基线，累计连续失败次数。
+                # 不立刻报错——偶发被拦是常态，连续多次才说明真出问题。
+                fails[name] = fails.get(name, 0) + 1
+                print(f"[ERROR] [{name}] 抓取失败({fails[name]} 连续): {e}",
+                      file=sys.stderr)
+                if fails[name] == ALERT_THRESHOLD:
+                    newly_broken.append(name)
                 continue
-            finally:
-                context.close()
 
+            # 成功 → 清零失败计数
+            fails[name] = 0
             print(f"[INFO] [{name}] 当前在售 {len(current)} 个: {sorted(current)}")
 
-            first_run = name not in state
-            seen = set(state.get(name, []))
+            first_run = name not in watches
+            seen = set(watches.get(name, []))
             new_slugs = set(current) - seen
 
             if new_slugs and not first_run:
@@ -216,13 +246,28 @@ def main() -> int:
                 print(f"[INFO] [{name}] 没有新款")
 
             # 更新该款基线（只在成功抓取时更新）
-            state[name] = sorted(current)
+            watches[name] = sorted(current)
 
         browser.close()
 
     save_state(state)
-    # 有任何一款抓取失败就让这次运行标红，方便发现问题
-    return 1 if had_error else 0
+
+    # 只有某款"连续失败到阈值"才告警一次（避免偶发抖动刷屏 / 持续坏了又不刷屏）
+    if newly_broken:
+        try:
+            send_email(
+                "⚠️ Hermès 监控可能失效，请检查",
+                "以下监控款已连续多次抓取失败（约 "
+                f"{ALERT_THRESHOLD * 10} 分钟没查成），可能是爱马仕反爬升级或网站改版：\n\n"
+                + "\n".join(f"· {n}" for n in newly_broken)
+                + "\n\n监控仍会继续重试；恢复后会自动静默，无需理会本邮件。",
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[ERROR] 告警邮件发送失败: {e}", file=sys.stderr)
+
+    # 始终正常退出：偶发被拦不再让 GitHub 发"All jobs have failed"。
+    # 真正持续故障由上面的告警邮件负责通知。
+    return 0
 
 
 if __name__ == "__main__":
