@@ -116,8 +116,9 @@ def fetch_products(page, url: str, slug_filter: str, name: str = "") -> dict[str
     return products
 
 
-# 连续失败多少次才告警（每 10 分钟一跑；4 次≈40 分钟都拿不到 → 多半真出问题了）
-ALERT_THRESHOLD = 4
+# 连续失败多少次才告警。数据中心 IP 被 Akamai 软拦是偶发常态，一段 40 分钟的
+# 坏窗口属正常波动；只有持续约 1.5 小时（9 轮）都拿不到，才像真出问题，才告警。
+ALERT_THRESHOLD = 9
 
 # 某货号要"连续缺席"多少轮才判定真下架（防单轮渲染抖动误判 → 避免重复发邮件）。
 # 2 轮≈20 分钟。下架满此阈值后再上架才会再次通知。
@@ -153,20 +154,31 @@ def save_state(state: dict) -> None:
 # ----------------------------------------------------------------------
 # 抓取一款：用全新 context（首访最不易被拦）；失败时再换全新 context 补抓一次
 # ----------------------------------------------------------------------
+HOME_URL = "https://www.hermes.com/au/en/"
+
+
 def fetch_watch(browser, w: dict) -> dict[str, str]:
     last_err: Exception | None = None
-    for tryno in (1, 2):
+    attempts = 3  # 失败就换全新 context 再试，最多 3 次
+    for tryno in range(1, attempts + 1):
         context = browser.new_context(
             locale="en-AU", viewport={"width": 1366, "height": 900}
         )
         context.add_init_script(STEALTH_JS)
         page = context.new_page()
         try:
+            # 预热：先正常访问首页，让 Akamai 的 JS 跑起来、种好校验 cookie，
+            # 再跳搜索页。直接深链打开搜索页更像爬虫，数据中心 IP 尤其容易被拦。
+            try:
+                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2500)
+            except Exception:  # noqa: BLE001
+                pass  # 预热失败不致命，继续尝试搜索页
             return fetch_products(page, w["url"], w["slug"], w["name"])
         except Exception as e:  # noqa: BLE001
             last_err = e
-            if tryno == 1:
-                print(f"[WARN] [{w['name']}] 第 1 轮失败，换全新浏览器再试一次…")
+            if tryno < attempts:
+                print(f"[WARN] [{w['name']}] 第 {tryno} 次失败，换全新浏览器再试…")
         finally:
             context.close()
     assert last_err is not None
