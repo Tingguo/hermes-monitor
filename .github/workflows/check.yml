@@ -1,19 +1,31 @@
-name: Hermès Lindy 监控
+name: Hermès 监控
 
 on:
-  schedule:
-    # 每 10 分钟运行一次（GitHub 高峰期可能略延迟）
-    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       send_test:
         description: "只发一封测试邮件验证通道（不检查库存）"
         type: boolean
         default: false
+  schedule:
+    # 兜底：万一“接力链”断了（如 PAT 失效），GitHub 会重新拉起。
+    # 实际触发频率由 GitHub 决定（免费版定时是尽力而为，可能延迟），仅作保险。
+    - cron: "7,37 * * * *"
+
+# 同一时间只允许一个监控在跑：新排队的会取代上一个等待者，旧的等待者自动取消，
+# 所以 cron 和“接力”重复触发也不会堆积成一堆并行任务。
+concurrency:
+  group: hermes-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  check:
+  monitor:
     runs-on: ubuntu-latest
+    # 单个任务最长 6 小时；设 5h50m，给循环(5.5h)结束后的“接力”留出余量。
+    timeout-minutes: 350
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
@@ -26,21 +38,18 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      # 缓存浏览器，避免每次重新下载
       - name: 缓存 Chrome
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chrome-v1
 
-      # 安装真实 Google Chrome（channel=chrome 需要）+ 系统依赖 + 虚拟显示器
       - name: 安装 Chrome 和 xvfb
         run: |
           python -m playwright install-deps chromium
           python -m playwright install chrome
           sudo apt-get install -y xvfb
 
-      # 用缓存在多次运行之间保存 state.json（记住上次见到哪些款）
       - name: 恢复上次状态
         uses: actions/cache@v4
         with:
@@ -49,13 +58,29 @@ jobs:
           restore-keys: |
             hermes-state-
 
-      - name: 运行监控（有头模式，用 xvfb 提供虚拟显示器）
+      - name: 运行监控（循环：每 10 分钟一轮，连续约 5.5 小时）
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_TEST: ${{ (inputs.send_test == true || inputs.send_test == 'true') && '1' || '' }}
+          # 测试模式只发一封就退出；其余情况进入 5.5 小时循环、每 600s 一轮
+          RUN_MINUTES: ${{ (inputs.send_test == true || inputs.send_test == 'true') && '0' || '330' }}
+          INTERVAL_SEC: "600"
         run: xvfb-run -a python monitor.py
+
+      - name: 接力（结束前重新触发自己，实现持续不间断运行）
+        # 测试运行不接力；其余无论成败都接力，保证永远有“下一棒”在排队。
+        if: ${{ always() && !(inputs.send_test == true || inputs.send_test == 'true') }}
+        env:
+          PAT: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          curl -s -o /dev/null -w "接力触发 HTTP %{http_code}\n" \
+            -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/check.yml/dispatches" \
+            -d '{"ref":"main"}'
 
       - name: 上传调试截图（仅在抓取失败时有内容）
         if: always()

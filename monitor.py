@@ -16,6 +16,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
@@ -188,6 +189,69 @@ def nice_name(slug: str) -> str:
 # ----------------------------------------------------------------------
 # 主流程
 # ----------------------------------------------------------------------
+def launch_browser(p):
+    # channel="chrome" 用系统真实 Chrome（比内置 Chromium 更难被识破）
+    return p.chromium.launch(
+        headless=HEADLESS,
+        channel="chrome",
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+
+
+def run_pass(browser, state: dict) -> None:
+    """对所有 WATCHES 做一轮检查：抓取→对比基线→发上新邮件，原地更新 state。"""
+    watches = state["watches"]
+    fails = state["fails"]
+
+    for w in WATCHES:
+        name = w["name"]
+        try:
+            current = fetch_watch(browser, w)
+        except Exception as e:  # noqa: BLE001
+            # 抓取失败（多半是 Akamai 临时软拦）：保留旧基线，累计连续失败次数。
+            # 不立刻报错——偶发被拦是常态，连续多次才说明真出问题。
+            fails[name] = fails.get(name, 0) + 1
+            print(f"[ERROR] [{name}] 抓取失败({fails[name]} 连续): {e}",
+                  file=sys.stderr)
+            # 连续失败正好到阈值时告警一次（避免偶发抖动刷屏 / 持续坏了又不刷屏）
+            if fails[name] == ALERT_THRESHOLD:
+                try:
+                    send_email(
+                        "⚠️ Hermès 监控可能失效，请检查",
+                        f"监控款【{name}】已连续 {ALERT_THRESHOLD} 次抓取失败"
+                        f"（约 {ALERT_THRESHOLD * 10} 分钟没查成），"
+                        "可能是爱马仕反爬升级或网站改版。\n\n"
+                        "监控仍会继续重试；恢复后会自动静默，无需理会本邮件。",
+                    )
+                except Exception as ee:  # noqa: BLE001
+                    print(f"[ERROR] 告警邮件发送失败: {ee}", file=sys.stderr)
+            continue
+
+        # 成功 → 清零失败计数
+        fails[name] = 0
+        print(f"[INFO] [{name}] 当前在售 {len(current)} 个: {sorted(current)}")
+
+        first_run = name not in watches
+        seen = set(watches.get(name, []))
+        new_slugs = set(current) - seen
+
+        if new_slugs and not first_run:
+            kw = w["keyword"].lower()
+            ordered = sorted(new_slugs, key=lambda s: (kw not in s.lower(), s))
+            lines = [f"· {nice_name(s)}\n{current[s]}" for s in ordered]
+            body = (f"爱马仕澳洲官网【{name}】出现新款（可能上线了）：\n\n"
+                    + "\n\n".join(lines))
+            title = f"🎉 Hermès 上新！{nice_name(ordered[0])}"
+            send_email(title, body)
+        elif first_run:
+            print(f"[INFO] [{name}] 首次运行，记录基线，不发通知")
+        else:
+            print(f"[INFO] [{name}] 没有新款")
+
+        # 更新该款基线（只在成功抓取时更新）
+        watches[name] = sorted(current)
+
+
 def main() -> int:
     # 自检：发一封测试邮件确认通道，然后退出
     if os.environ.get("SEND_TEST") == "1":
@@ -197,76 +261,44 @@ def main() -> int:
         )
         return 0
 
+    # RUN_MINUTES>0 → 循环模式：每 INTERVAL_SEC 查一轮，连续跑约 RUN_MINUTES 分钟。
+    # =0（默认）→ 只查一轮就退出（本地调试 / 兜底单次）。
+    run_minutes = int(os.environ.get("RUN_MINUTES", "0") or "0")
+    interval = int(os.environ.get("INTERVAL_SEC", "600") or "600")
+
     state = load_state()
-    watches = state["watches"]
-    fails = state["fails"]
-    newly_broken: list[str] = []  # 这次刚好达到告警阈值的款
+    deadline = time.time() + run_minutes * 60
 
     with sync_playwright() as p:
-        # channel="chrome" 用系统真实 Chrome（比内置 Chromium 更难被识破）
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            channel="chrome",
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-
-        for w in WATCHES:
-            name = w["name"]
+        browser = launch_browser(p)
+        round_no = 0
+        while True:
+            round_no += 1
+            print(f"\n===== 第 {round_no} 轮检查 @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
             try:
-                current = fetch_watch(browser, w)
+                run_pass(browser, state)
             except Exception as e:  # noqa: BLE001
-                # 抓取失败（多半是 Akamai 临时软拦）：保留旧基线，累计连续失败次数。
-                # 不立刻报错——偶发被拦是常态，连续多次才说明真出问题。
-                fails[name] = fails.get(name, 0) + 1
-                print(f"[ERROR] [{name}] 抓取失败({fails[name]} 连续): {e}",
-                      file=sys.stderr)
-                if fails[name] == ALERT_THRESHOLD:
-                    newly_broken.append(name)
-                continue
+                # 浏览器层面崩了（极少）→ 重启浏览器，下一轮继续
+                print(f"[ERROR] 本轮异常，重启浏览器: {e}", file=sys.stderr)
+                try:
+                    browser.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                browser = launch_browser(p)
 
-            # 成功 → 清零失败计数
-            fails[name] = 0
-            print(f"[INFO] [{name}] 当前在售 {len(current)} 个: {sorted(current)}")
+            save_state(state)  # 每轮都落盘，任务被强杀时缓存仍是最新
 
-            first_run = name not in watches
-            seen = set(watches.get(name, []))
-            new_slugs = set(current) - seen
+            # 单次模式，或再睡一轮就超时了 → 收工（留时间给"接力"步骤）
+            if run_minutes <= 0 or time.time() + interval >= deadline:
+                break
+            print(f"[INFO] 等待 {interval}s 后进行下一轮…")
+            time.sleep(interval)
 
-            if new_slugs and not first_run:
-                kw = w["keyword"].lower()
-                ordered = sorted(new_slugs, key=lambda s: (kw not in s.lower(), s))
-                lines = [f"· {nice_name(s)}\n{current[s]}" for s in ordered]
-                body = (f"爱马仕澳洲官网【{name}】出现新款（可能上线了）：\n\n"
-                        + "\n\n".join(lines))
-                title = f"🎉 Hermès 上新！{nice_name(ordered[0])}"
-                send_email(title, body)
-            elif first_run:
-                print(f"[INFO] [{name}] 首次运行，记录基线，不发通知")
-            else:
-                print(f"[INFO] [{name}] 没有新款")
-
-            # 更新该款基线（只在成功抓取时更新）
-            watches[name] = sorted(current)
-
-        browser.close()
-
-    save_state(state)
-
-    # 只有某款"连续失败到阈值"才告警一次（避免偶发抖动刷屏 / 持续坏了又不刷屏）
-    if newly_broken:
         try:
-            send_email(
-                "⚠️ Hermès 监控可能失效，请检查",
-                "以下监控款已连续多次抓取失败（约 "
-                f"{ALERT_THRESHOLD * 10} 分钟没查成），可能是爱马仕反爬升级或网站改版：\n\n"
-                + "\n".join(f"· {n}" for n in newly_broken)
-                + "\n\n监控仍会继续重试；恢复后会自动静默，无需理会本邮件。",
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"[ERROR] 告警邮件发送失败: {e}", file=sys.stderr)
+            browser.close()
+        except Exception:  # noqa: BLE001
+            pass
 
-    # 始终正常退出：偶发被拦不再让 GitHub 发"All jobs have failed"。
-    # 真正持续故障由上面的告警邮件负责通知。
     return 0
 
 
