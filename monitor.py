@@ -119,6 +119,10 @@ def fetch_products(page, url: str, slug_filter: str, name: str = "") -> dict[str
 # 连续失败多少次才告警（每 10 分钟一跑；4 次≈40 分钟都拿不到 → 多半真出问题了）
 ALERT_THRESHOLD = 4
 
+# 某货号要"连续缺席"多少轮才判定真下架（防单轮渲染抖动误判 → 避免重复发邮件）。
+# 2 轮≈20 分钟。下架满此阈值后再上架才会再次通知。
+ABSENT_GRACE = 2
+
 
 # ----------------------------------------------------------------------
 # 状态持久化
@@ -126,14 +130,19 @@ ALERT_THRESHOLD = 4
 #   fails:   {name: 连续失败次数}  用来区分"偶发被拦"和"真的坏了"
 # ----------------------------------------------------------------------
 def load_state() -> dict:
+    empty = {"watches": {}, "fails": {}, "misses": {}}
     if not os.path.exists(STATE_FILE):
-        return {"watches": {}, "fails": {}}
+        return empty
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {"watches": data.get("watches", {}), "fails": data.get("fails", {})}
+        return {
+            "watches": data.get("watches", {}),   # {name: [已通知且视为在售的 slug]}
+            "fails": data.get("fails", {}),        # {name: 连续抓取失败次数}
+            "misses": data.get("misses", {}),      # {name: {slug: 连续缺席轮数}}
+        }
     except (json.JSONDecodeError, OSError):
-        return {"watches": {}, "fails": {}}
+        return empty
 
 
 def save_state(state: dict) -> None:
@@ -202,6 +211,7 @@ def run_pass(browser, state: dict) -> None:
     """对所有 WATCHES 做一轮检查：抓取→对比基线→发上新邮件，原地更新 state。"""
     watches = state["watches"]
     fails = state["fails"]
+    misses = state["misses"]
 
     for w in WATCHES:
         name = w["name"]
@@ -232,8 +242,24 @@ def run_pass(browser, state: dict) -> None:
         print(f"[INFO] [{name}] 当前在售 {len(current)} 个: {sorted(current)}")
 
         first_run = name not in watches
-        seen = set(watches.get(name, []))
-        new_slugs = set(current) - seen
+        notified = set(watches.get(name, []))   # 已通知且仍视为在售的货号
+        miss = misses.setdefault(name, {})       # 各货号的连续缺席轮数
+        cur = set(current)
+
+        # 仅当某货号【不在已通知清单里】才算"新增/重新上架"→ 发邮件
+        new_slugs = cur - notified
+
+        # 处理"消失"的货号：连续缺席满 ABSENT_GRACE 轮才真正移出清单
+        #（防单轮渲染抖动误判下架，从而避免它"再现"时重复发邮件）
+        for slug in list(notified):
+            if slug in cur:
+                miss.pop(slug, None)             # 还在 → 缺席清零
+            else:
+                miss[slug] = miss.get(slug, 0) + 1
+                if miss[slug] >= ABSENT_GRACE:
+                    notified.discard(slug)        # 判定真下架，移出清单（将来重上会再通知）
+                    miss.pop(slug, None)
+                    print(f"[INFO] [{name}] 货号 {slug} 连续缺席，判定下架")
 
         if new_slugs and not first_run:
             kw = w["keyword"].lower()
@@ -246,10 +272,11 @@ def run_pass(browser, state: dict) -> None:
         elif first_run:
             print(f"[INFO] [{name}] 首次运行，记录基线，不发通知")
         else:
-            print(f"[INFO] [{name}] 没有新款")
+            print(f"[INFO] [{name}] 无新增（在售的都已通知过）")
 
-        # 更新该款基线（只在成功抓取时更新）
-        watches[name] = sorted(current)
+        # 新增的并入清单；缺席未到阈值的仍保留（不立即丢，避免抖动重复）
+        notified |= new_slugs
+        watches[name] = sorted(notified)
 
 
 def main() -> int:
