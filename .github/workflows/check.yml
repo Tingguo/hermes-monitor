@@ -7,6 +7,10 @@ on:
         description: "只发一封测试邮件验证通道（不检查库存）"
         type: boolean
         default: false
+      run_minutes:
+        description: "本次循环运行多少分钟（留空=330，约5.5小时；调试可填小值）"
+        type: string
+        default: ""
   schedule:
     # 兜底：万一“接力链”断了（如 PAT 失效），GitHub 会重新拉起。
     # 实际触发频率由 GitHub 决定（免费版定时是尽力而为，可能延迟），仅作保险。
@@ -64,8 +68,8 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SEND_TEST: ${{ (inputs.send_test == true || inputs.send_test == 'true') && '1' || '' }}
-          # 测试模式只发一封就退出；其余情况进入 5.5 小时循环、每 600s 一轮
-          RUN_MINUTES: ${{ (inputs.send_test == true || inputs.send_test == 'true') && '0' || '330' }}
+          # 测试模式只发一封就退出；否则按 run_minutes（默认 330=5.5h）循环
+          RUN_MINUTES: ${{ (inputs.send_test == true || inputs.send_test == 'true') && '0' || (inputs.run_minutes != '' && inputs.run_minutes || '330') }}
           INTERVAL_SEC: "600"
         run: xvfb-run -a python monitor.py
 
