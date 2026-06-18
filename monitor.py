@@ -154,12 +154,12 @@ def save_state(state: dict) -> None:
 # ----------------------------------------------------------------------
 # 抓取一款：用全新 context（首访最不易被拦）；失败时再换全新 context 补抓一次
 # ----------------------------------------------------------------------
-HOME_URL = "https://www.hermes.com/au/en/"
-
-
 def fetch_watch(browser, w: dict) -> dict[str, str]:
+    # 关键经验（已多次验证）：每次都用全新 context，并把搜索页作为该 context 的
+    # “首次访问”——本站对“同一 context 内的第二次导航”会间歇性软拦返回空页面，
+    # 所以【不做首页预热】，直接开搜索页最不易被拦。失败就换全新 context 重试。
     last_err: Exception | None = None
-    attempts = 3  # 失败就换全新 context 再试，最多 3 次
+    attempts = 3
     for tryno in range(1, attempts + 1):
         context = browser.new_context(
             locale="en-AU", viewport={"width": 1366, "height": 900}
@@ -167,13 +167,6 @@ def fetch_watch(browser, w: dict) -> dict[str, str]:
         context.add_init_script(STEALTH_JS)
         page = context.new_page()
         try:
-            # 预热：先正常访问首页，让 Akamai 的 JS 跑起来、种好校验 cookie，
-            # 再跳搜索页。直接深链打开搜索页更像爬虫，数据中心 IP 尤其容易被拦。
-            try:
-                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2500)
-            except Exception:  # noqa: BLE001
-                pass  # 预热失败不致命，继续尝试搜索页
             return fetch_products(page, w["url"], w["slug"], w["name"])
         except Exception as e:  # noqa: BLE001
             last_err = e
