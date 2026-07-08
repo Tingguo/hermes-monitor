@@ -116,9 +116,10 @@ def fetch_products(page, url: str, slug_filter: str, name: str = "") -> dict[str
     return products
 
 
-# 连续失败多少次才告警。数据中心 IP 被 Akamai 软拦是偶发常态，一段 40 分钟的
-# 坏窗口属正常波动；只有持续约 1.5 小时（9 轮）都拿不到，才像真出问题，才告警。
-ALERT_THRESHOLD = 9
+# 连续失败多少轮才告警。数据中心 IP 被 Akamai 软拦是偶发常态，短期被拦属正常。
+# 每 10 分钟一轮 → 一周 = 7*24*6 = 1008 轮。只有【连续一整周每轮都抓不到】才告警，
+# 任意一次成功立即清零重新计。这样偶发/短期问题绝不打扰你，只有真·长期挂了才提醒。
+ALERT_THRESHOLD = 7 * 24 * 6  # = 1008 轮 ≈ 连续 1 周
 
 # 某货号要"连续缺席"多少轮才判定真下架（防单轮渲染抖动误判 → 避免重复发邮件）。
 # 2 轮≈20 分钟。下架满此阈值后再上架才会再次通知。
@@ -231,11 +232,11 @@ def run_pass(browser, state: dict) -> None:
             # 连续失败正好到阈值时告警一次（避免偶发抖动刷屏 / 持续坏了又不刷屏）
             if fails[name] == ALERT_THRESHOLD:
                 try:
+                    days = ALERT_THRESHOLD * 10 // 60 // 24
                     send_email(
                         "⚠️ Hermès 监控可能失效，请检查",
-                        f"监控款【{name}】已连续 {ALERT_THRESHOLD} 次抓取失败"
-                        f"（约 {ALERT_THRESHOLD * 10} 分钟没查成），"
-                        "可能是爱马仕反爬升级或网站改版。\n\n"
+                        f"监控款【{name}】已连续约 {days} 天每次都抓取失败，"
+                        "期间一次都没连上，可能是爱马仕反爬升级或网站改版。\n\n"
                         "监控仍会继续重试；恢复后会自动静默，无需理会本邮件。",
                     )
                 except Exception as ee:  # noqa: BLE001
