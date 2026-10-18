@@ -32,15 +32,12 @@ from playwright.sync_api import sync_playwright
 # ----------------------------------------------------------------------
 WATCHES = [
     {
-        "name": "Lindy",
-        "url": "https://www.hermes.com/au/en/search/?s=lindy",
-        "slug": "lindy",
-        "keyword": "mini",
-    },
-    {
-        "name": "Neo Garden 23",
-        "url": "https://www.hermes.com/au/en/search/?s=neo%20garden",
-        "slug": "neo-garden",
+        # 官方名 "Neo Garden 23 bag"，货号链接形如 neo-garden-23-bag-H086418CKAM
+        #（有的带颜色前缀，如 noir-neo-garden-23-bag-…）。用 neo-garden-23 精确匹配，
+        # 排除同系列的 Neo Garden Voyage 41。
+        "name": "Neo Garden 23 bag",
+        "url": "https://www.hermes.com/au/en/search/?s=neo%20garden%2023",
+        "slug": "neo-garden-23",
         "keyword": "23",
     },
 ]
@@ -247,7 +244,6 @@ def run_pass(browser, state: dict) -> None:
         fails[name] = 0
         print(f"[INFO] [{name}] 当前在售 {len(current)} 个: {sorted(current)}")
 
-        first_run = name not in watches
         notified = set(watches.get(name, []))   # 已通知且仍视为在售的货号
         miss = misses.setdefault(name, {})       # 各货号的连续缺席轮数
         cur = set(current)
@@ -267,7 +263,8 @@ def run_pass(browser, state: dict) -> None:
                     miss.pop(slug, None)
                     print(f"[INFO] [{name}] 货号 {slug} 连续缺席，判定下架")
 
-        if new_slugs and not first_run:
+        # slug 已精确过滤，命中即为目标包 → 首次运行就有货也照样通知
+        if new_slugs:
             kw = w["keyword"].lower()
             ordered = sorted(new_slugs, key=lambda s: (kw not in s.lower(), s))
             lines = [f"· {nice_name(s)}\n{current[s]}" for s in ordered]
@@ -275,8 +272,8 @@ def run_pass(browser, state: dict) -> None:
                     + "\n\n".join(lines))
             title = f"🎉 Hermès 上新！{nice_name(ordered[0])}"
             send_email(title, body)
-        elif first_run:
-            print(f"[INFO] [{name}] 首次运行，记录基线，不发通知")
+        elif not cur:
+            print(f"[INFO] [{name}] 暂无货")
         else:
             print(f"[INFO] [{name}] 无新增（在售的都已通知过）")
 

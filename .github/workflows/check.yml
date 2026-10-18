@@ -86,6 +86,17 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/check.yml/dispatches" \
             -d '{"ref":"main"}'
 
+      - name: 保活（防止 GitHub 因仓库 60 天无提交自动停用本 workflow）
+        if: ${{ always() }}
+        env:
+          PAT: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          curl -s -o /dev/null -w "保活 HTTP %{http_code}\n" \
+            -X PUT \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/check.yml/enable"
+
       - name: 上传调试截图（仅在抓取失败时有内容）
         if: always()
         uses: actions/upload-artifact@v4
